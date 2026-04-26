@@ -1,0 +1,187 @@
+name: ðŸ§  Claude AI â€” Commit Analysis & Auto-Doc
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - 'release/**'
+      - 'feat/**'
+      - 'fix/**'
+    paths-ignore:
+      - '**.md'
+      - '.github/**'
+      - 'docs/**'
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  claude-commit-analysis:
+    name: Claude Commit Intelligence
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50      # Last 50 commits for pattern analysis
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install @anthropic-ai/sdk
+
+      - name: Gather commit context
+        id: gather
+        run: |
+          # Last commit details
+          git log -1 --format="%H|%an|%ae|%s|%b" > /tmp/last_commit.txt
+
+          # Diff of last commit
+          git diff HEAD~1 HEAD > /tmp/commit_diff.txt 2>/dev/null || \
+            git diff 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD > /tmp/commit_diff.txt
+
+          # Recent commit history (last 20)
+          git log --oneline -20 > /tmp/recent_commits.txt
+
+          # File tree (respects .gitignore)
+          find . -type f \
+            ! -path './.git/*' \
+            ! -path './node_modules/*' \
+            ! -path './.next/*' \
+            ! -path './dist/*' \
+            ! -path './build/*' \
+            | head -200 > /tmp/file_tree.txt
+
+          DIFF_SIZE=$(wc -c < /tmp/commit_diff.txt)
+          echo "diff_size=$DIFF_SIZE" >> $GITHUB_OUTPUT
+
+      - name: Claude commit analysis + changelog
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          node << 'EOF'
+          const Anthropic = require('@anthropic-ai/sdk');
+          const fs = require('fs');
+
+          const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+          const lastCommit = fs.readFileSync('/tmp/last_commit.txt', 'utf8').trim();
+          const diff = fs.readFileSync('/tmp/commit_diff.txt', 'utf8').slice(0, 120000);
+          const recentCommits = fs.readFileSync('/tmp/recent_commits.txt', 'utf8');
+          const fileTree = fs.readFileSync('/tmp/file_tree.txt', 'utf8');
+
+          const [sha, author, email, subject, body] = lastCommit.split('|');
+
+          const systemPrompt = `You are a senior engineering lead reviewing commits for quality, 
+security, and architectural impact. Be terse, precise, and developer-focused. 
+Never be sycophantic. Output clean GitHub Markdown only.`;
+
+          const userContent = `Analyze this commit and provide:
+
+## 1. Commit Quality Score (1-10) with reasoning
+## 2. Impact Assessment (what actually changed and why it matters)
+## 3. Security Scan (flag anything suspicious â€” hardcoded secrets, unsafe inputs, SQL, XSS, etc.)
+## 4. Performance Notes (any obvious regressions or improvements)
+## 5. Changelog Entry (one line, conventional commit format, for CHANGELOG.md)
+## 6. Follow-up Suggestions (max 3 concrete next steps)
+
+---
+
+**Repo:** ${process.env.REPO}
+**Branch:** ${process.env.BRANCH}
+**SHA:** ${process.env.SHA}
+**Author:** ${author} <${email}>
+**Commit Message:** ${subject}
+${body ? `**Body:** ${body}` : ''}
+
+**Recent History (for context):**
+${recentCommits}
+
+**Repository File Tree (sample):**
+${fileTree.slice(0, 3000)}
+
+**Commit Diff:**
+\`\`\`diff
+${diff}
+\`\`\``;
+
+          const response = await client.messages.create({
+            model: 'claude-opus-4-5',
+            max_tokens: 2048,
+            system: systemPrompt,
+            messages: [{ role: 'user', content: userContent }]
+          });
+
+          const analysis = response.content[0].text;
+          
+          // Extract changelog line for potential auto-update
+          const changelogMatch = analysis.match(/##\s*5\..*?\n(.*?)(?:\n##|\n---|\n$)/s);
+          const changelogEntry = changelogMatch ? changelogMatch[1].trim() : null;
+
+          const output = {
+            analysis,
+            changelogEntry,
+            sha: process.env.SHA,
+            tokens: response.usage
+          };
+
+          fs.writeFileSync('/tmp/commit_analysis.md', analysis);
+          fs.writeFileSync('/tmp/commit_analysis.json', JSON.stringify(output, null, 2));
+
+          if (changelogEntry) {
+            fs.writeFileSync('/tmp/changelog_entry.txt', changelogEntry);
+          }
+
+          console.log('Analysis complete.');
+          console.log(`Tokens â€” input: ${response.usage.input_tokens}, output: ${response.usage.output_tokens}`);
+          EOF
+
+      - name: Update CHANGELOG.md
+        run: |
+          if [ -f /tmp/changelog_entry.txt ]; then
+            ENTRY=$(cat /tmp/changelog_entry.txt)
+            DATE=$(date +%Y-%m-%d)
+            SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+
+            # Create CHANGELOG if it doesn't exist
+            if [ ! -f CHANGELOG.md ]; then
+              echo "# Changelog" > CHANGELOG.md
+              echo "" >> CHANGELOG.md
+            fi
+
+            # Prepend new entry after the first line
+            TEMP=$(mktemp)
+            head -1 CHANGELOG.md > $TEMP
+            echo "" >> $TEMP
+            echo "## [$DATE] - $SHA_SHORT" >> $TEMP
+            echo "- $ENTRY" >> $TEMP
+            echo "" >> $TEMP
+            tail -n +2 CHANGELOG.md >> $TEMP
+            mv $TEMP CHANGELOG.md
+
+            git config user.name "claude-bot"
+            git config user.email "claude-bot@anthropic.ai"
+            git add CHANGELOG.md
+            git commit -m "docs: auto-update CHANGELOG [$SHA_SHORT] [skip ci]" || true
+            git push || true
+          fi
+
+      - name: Post analysis as commit comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ANALYSIS=$(cat /tmp/commit_analysis.md)
+          gh api repos/${{ github.repository }}/commits/${{ github.sha }}/comments \
+            -f body="$ANALYSIS" || true
