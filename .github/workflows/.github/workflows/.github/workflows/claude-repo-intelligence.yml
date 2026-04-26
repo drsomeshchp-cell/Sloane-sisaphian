@@ -1,0 +1,229 @@
+name: ðŸ§  Claude AI â€” Repo Intelligence (Weekly Deep Scan)
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'       # Every Monday at 9am UTC
+  workflow_dispatch:            # Manual trigger anytime
+    inputs:
+      scope:
+        description: 'Analysis scope'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - security
+          - architecture
+          - performance
+          - docs
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  claude-deep-scan:
+    name: Claude Full Repository Intelligence
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout full repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Anthropic SDK
+        run: npm install @anthropic-ai/sdk
+
+      - name: Build maximum context payload
+        id: context
+        env:
+          SCOPE: ${{ github.event.inputs.scope || 'full' }}
+        run: |
+          # Complete file tree
+          find . -type f \
+            ! -path './.git/*' \
+            ! -path './node_modules/*' \
+            ! -path './.next/*' \
+            ! -path './dist/*' \
+            ! -path './build/*' \
+            ! -path './__pycache__/*' \
+            ! -path './venv/*' \
+            > /tmp/all_files.txt
+
+          # Read source files into a combined context (up to 150k chars)
+          python3 << 'PYEOF'
+          import os, json
+
+          files = open('/tmp/all_files.txt').read().strip().split('\n')
+          
+          # Prioritize source files
+          priority_exts = {'.py', '.js', '.ts', '.tsx', '.jsx', '.go', '.rs', '.java', '.rb', '.php', '.cs', '.cpp', '.c', '.h'}
+          config_exts = {'.json', '.yaml', '.yml', '.toml', '.env.example', '.cfg', '.ini'}
+          
+          source_files = [f for f in files if any(f.endswith(e) for e in priority_exts)]
+          config_files = [f for f in files if any(f.endswith(e) for e in config_exts)]
+          
+          combined = []
+          total_chars = 0
+          MAX_CHARS = 150000
+          
+          for filepath in source_files + config_files:
+              if total_chars >= MAX_CHARS:
+                  break
+              try:
+                  content = open(filepath).read()
+                  entry = f"\n\n{'='*60}\nFILE: {filepath}\n{'='*60}\n{content}"
+                  if total_chars + len(entry) < MAX_CHARS:
+                      combined.append(entry)
+                      total_chars += len(entry)
+              except:
+                  pass
+          
+          open('/tmp/repo_content.txt', 'w').write(''.join(combined))
+          print(f"Packed {len(combined)} files, {total_chars:,} chars")
+          PYEOF
+
+          # Git statistics
+          git log --since="30 days ago" --oneline > /tmp/recent_history.txt
+          git shortlog -sn --since="30 days ago" > /tmp/contributors.txt
+          git diff HEAD~10 HEAD --stat 2>/dev/null > /tmp/recent_changes.txt || true
+
+          # Dependency files
+          for f in package.json requirements.txt Cargo.toml go.mod Gemfile pyproject.toml pom.xml; do
+            [ -f "$f" ] && cat "$f" >> /tmp/deps.txt && echo "---$f---" >> /tmp/deps.txt
+          done || true
+
+          echo "context_ready=true" >> $GITHUB_OUTPUT
+
+      - name: Claude deep repository analysis
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REPO: ${{ github.repository }}
+          SCOPE: ${{ github.event.inputs.scope || 'full' }}
+        run: |
+          node << 'EOF'
+          const Anthropic = require('@anthropic-ai/sdk');
+          const fs = require('fs');
+
+          const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+          const scope = process.env.SCOPE || 'full';
+
+          const repoContent = fs.readFileSync('/tmp/repo_content.txt', 'utf8');
+          const recentHistory = fs.readFileSync('/tmp/recent_history.txt', 'utf8');
+          const contributors = fs.readFileSync('/tmp/contributors.txt', 'utf8');
+          const deps = fs.existsSync('/tmp/deps.txt') ? fs.readFileSync('/tmp/deps.txt', 'utf8').slice(0, 8000) : '';
+
+          const scopeInstructions = {
+            full: `Perform a complete repository audit covering:
+1. **Architecture Overview** â€” what this codebase does, its patterns, key modules
+2. **Security Audit** â€” vulnerabilities, exposed secrets, unsafe patterns, dependency risks
+3. **Code Quality** â€” anti-patterns, technical debt hotspots, dead code
+4. **Performance** â€” bottlenecks, N+1 queries, memory leaks, inefficient algorithms
+5. **Documentation Gaps** â€” undocumented public APIs, missing READMEs, stale docs
+6. **Dependency Health** â€” outdated, vulnerable, or abandoned packages
+7. **Top 5 Recommended Actions** â€” prioritized, actionable, with file references`,
+            security: `Perform a DEEP SECURITY AUDIT only. Focus on:
+- Hardcoded secrets, API keys, tokens
+- SQL injection, XSS, CSRF vulnerabilities
+- Insecure deserialization, path traversal
+- Vulnerable dependencies (check versions)
+- Auth/authz flaws
+- Data exposure risks
+Output a severity-sorted list of findings with exact file:line references.`,
+            architecture: `Analyze the ARCHITECTURE only:
+- System design patterns used (MVC, microservices, event-driven, etc.)
+- Module coupling and cohesion
+- Separation of concerns violations
+- Scalability bottlenecks
+- Suggested refactors with rationale`,
+            performance: `Audit for PERFORMANCE issues only:
+- Algorithmic complexity problems (O(nÂ²), etc.)
+- Database query patterns (N+1, missing indexes)
+- Memory leaks and GC pressure
+- Blocking I/O in async contexts
+- Bundle size / load time issues`,
+            docs: `Audit DOCUMENTATION gaps only:
+- Missing/outdated README sections
+- Undocumented public APIs and functions
+- Missing architecture decision records
+- Stale comments
+- Generate a documentation improvement plan`
+          };
+
+          const systemPrompt = `You are a principal engineer performing a deep repository audit.
+Be ruthlessly precise. Every finding must reference specific files.
+Format output as clean, structured GitHub Markdown suitable for a GitHub Issue.`;
+
+          const userContent = `**Repository:** ${process.env.REPO}
+**Analysis Scope:** ${scope.toUpperCase()}
+**Recent Activity (30 days):**
+${recentHistory.slice(0, 3000)}
+
+**Top Contributors:**
+${contributors}
+
+**Dependencies:**
+${deps.slice(0, 5000)}
+
+**Repository Source Code:**
+${repoContent}
+
+---
+
+${scopeInstructions[scope] || scopeInstructions.full}`;
+
+          console.log(`Starting ${scope} analysis... (${repoContent.length.toLocaleString()} chars of source)`);
+
+          const response = await client.messages.create({
+            model: 'claude-opus-4-5',
+            max_tokens: 8192,
+            thinking: {
+              type: 'enabled',
+              budget_tokens: 16000    // Max thinking for deep analysis
+            },
+            system: systemPrompt,
+            messages: [{ role: 'user', content: userContent }]
+          });
+
+          const analysis = response.content
+            .filter(b => b.type === 'text')
+            .map(b => b.text)
+            .join('\n\n');
+
+          const thinkingUsed = response.content.some(b => b.type === 'thinking');
+
+          const footer = `\n\n---\n> ðŸ¤– **Claude Repository Intelligence** | Model: \`${response.model}\` | Scope: \`${scope}\` | Extended thinking: ${thinkingUsed ? 'âœ…' : 'âŒ'} | Input tokens: ${response.usage.input_tokens.toLocaleString()} | Generated: ${new Date().toISOString().split('T')[0]}`;
+
+          fs.writeFileSync('/tmp/repo_analysis.md', analysis + footer);
+          console.log(`Analysis complete. Tokens: ${response.usage.input_tokens} in, ${response.usage.output_tokens} out`);
+          EOF
+
+      - name: Create GitHub Issue with findings
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCOPE: ${{ github.event.inputs.scope || 'full' }}
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          TITLE="ðŸ§  Claude Repo Intelligence Report â€” ${SCOPE^} Scan ($DATE)"
+          BODY=$(cat /tmp/repo_analysis.md)
+
+          gh issue create \
+            --title "$TITLE" \
+            --body "$BODY" \
+            --label "claude-analysis,automated" \
+            --assignee "${{ github.actor }}" 2>/dev/null || \
+          gh issue create \
+            --title "$TITLE" \
+            --body "$BODY" \
+            --label "claude-analysis" 2>/dev/null || \
+          gh issue create \
+            --title "$TITLE" \
+            --body "$BODY"
