@@ -1,0 +1,203 @@
+name: ðŸ§  Claude AI â€” PR Review (Maximal)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+
+# Prevent duplicate runs on the same PR
+concurrency:
+  group: claude-pr-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: write
+
+jobs:
+  claude-review:
+    name: Claude Full-Context Review
+    runs-on: ubuntu-latest
+    # Only run on PRs (not draft), or when @claude is mentioned in a comment
+    if: |
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') && github.event.issue.pull_request)
+
+    steps:
+      - name: Checkout full repo history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # Full git history for blame/log context
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Anthropic SDK
+        run: npm install @anthropic-ai/sdk
+
+      - name: Gather maximum PR context
+        id: context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Full diff with context
+          git diff $BASE_SHA...$HEAD_SHA > /tmp/full_diff.txt
+
+          # File list changed
+          git diff --name-status $BASE_SHA...$HEAD_SHA > /tmp/changed_files.txt
+
+          # Commit messages in this PR
+          git log $BASE_SHA..$HEAD_SHA --oneline --no-merges > /tmp/commits.txt
+
+          # PR description and metadata via GH CLI
+          gh pr view $PR_NUMBER --json title,body,labels,assignees,reviewers,additions,deletions,changedFiles \
+            > /tmp/pr_meta.json 2>/dev/null || echo "{}" > /tmp/pr_meta.json
+
+          # Existing review comments (for context on re-runs)
+          gh pr view $PR_NUMBER --json comments,reviews \
+            > /tmp/pr_comments.json 2>/dev/null || echo "{}" > /tmp/pr_comments.json
+
+          # Triggering comment if this is a @claude mention
+          TRIGGER_COMMENT="${{ github.event.comment.body }}"
+          echo "$TRIGGER_COMMENT" > /tmp/trigger_comment.txt
+
+          # Stats
+          DIFF_LINES=$(wc -l < /tmp/full_diff.txt)
+          CHANGED=$(cat /tmp/changed_files.txt | wc -l)
+          echo "diff_lines=$DIFF_LINES" >> $GITHUB_OUTPUT
+          echo "changed_files=$CHANGED" >> $GITHUB_OUTPUT
+
+      - name: Run Claude maximal review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          REPO: ${{ github.repository }}
+          TRIGGER_EVENT: ${{ github.event_name }}
+        run: |
+          node << 'EOF'
+          const Anthropic = require('@anthropic-ai/sdk');
+          const fs = require('fs');
+
+          const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+          // Load all context
+          const diff = fs.readFileSync('/tmp/full_diff.txt', 'utf8').slice(0, 180000); // ~180k chars safe for context
+          const changedFiles = fs.readFileSync('/tmp/changed_files.txt', 'utf8');
+          const commits = fs.readFileSync('/tmp/commits.txt', 'utf8');
+          const prMeta = JSON.parse(fs.readFileSync('/tmp/pr_meta.json', 'utf8'));
+          const prComments = JSON.parse(fs.readFileSync('/tmp/pr_comments.json', 'utf8'));
+          const triggerComment = fs.readFileSync('/tmp/trigger_comment.txt', 'utf8').trim();
+
+          const isDirectMention = triggerComment.includes('@claude');
+          const userQuestion = isDirectMention ? triggerComment.replace('@claude', '').trim() : null;
+
+          const systemPrompt = `You are an expert senior software engineer conducting a thorough code review. 
+You have access to the FULL diff, commit history, PR description, and existing comments.
+
+Your review must be:
+- **Comprehensive**: Cover correctness, security, performance, architecture, and maintainability
+- **Precise**: Reference specific file names and line numbers from the diff
+- **Actionable**: Every issue must have a concrete suggestion or fix
+- **Prioritized**: Mark issues as ðŸ”´ Critical / ðŸŸ¡ Warning / ðŸŸ¢ Suggestion / ðŸ’¡ Nit
+
+Format your response in clean GitHub Markdown.
+Start with a ## Summary section (2-3 sentences).
+Then use these sections as relevant:
+- ## ðŸ”´ Critical Issues (blockers)
+- ## ðŸŸ¡ Warnings (should fix)
+- ## ðŸŸ¢ Suggestions (nice to have)
+- ## âœ… What's Done Well
+- ## ðŸ“‹ Checklist (if applicable)
+
+End with a final verdict: **APPROVE** / **REQUEST CHANGES** / **COMMENT**`;
+
+          const userContent = isDirectMention
+            ? `The developer is asking you directly: "${userQuestion}"
+
+Here is the full PR context to answer their question:
+
+**PR:** ${process.env.PR_TITLE} (#${process.env.PR_NUMBER})
+**Repo:** ${process.env.REPO}
+
+**PR Description:**
+${prMeta.body || 'No description provided.'}
+
+**Changed Files (${prMeta.changedFiles || 0} files, +${prMeta.additions || 0} -${prMeta.deletions || 0}):**
+${changedFiles}
+
+**Commits:**
+${commits}
+
+**Full Diff:**
+\`\`\`diff
+${diff}
+\`\`\``
+            : `Please perform a full code review of this pull request.
+
+**PR Title:** ${process.env.PR_TITLE} (#${process.env.PR_NUMBER})
+**Repository:** ${process.env.REPO}
+**Labels:** ${(prMeta.labels || []).map(l => l.name).join(', ') || 'none'}
+
+**PR Description:**
+${prMeta.body || 'No description provided.'}
+
+**Commits in this PR:**
+${commits}
+
+**Changed Files (${prMeta.changedFiles || 0} files, +${prMeta.additions || 0} -${prMeta.deletions || 0}):**
+${changedFiles}
+
+**Full Diff:**
+\`\`\`diff
+${diff}
+\`\`\`
+
+${prComments.reviews?.length ? `**Prior Review Context:**\n${JSON.stringify(prComments.reviews.slice(-3), null, 2)}` : ''}`;
+
+          console.log(`Sending to Claude claude-opus-4-5... (diff: ${diff.length} chars)`);
+
+          const response = await client.messages.create({
+            model: 'claude-opus-4-5',      // Most capable model
+            max_tokens: 4096,
+            thinking: {
+              type: 'enabled',
+              budget_tokens: 8000           // Extended thinking for deep analysis
+            },
+            system: systemPrompt,
+            messages: [{ role: 'user', content: userContent }]
+          });
+
+          // Extract text from response (thinking blocks are separate)
+          const reviewText = response.content
+            .filter(block => block.type === 'text')
+            .map(block => block.text)
+            .join('\n\n');
+
+          // Add metadata footer
+          const footer = `\n\n---\n<details><summary>ðŸ¤– Claude Review Metadata</summary>\n\n- **Model:** ${response.model}\n- **Input tokens:** ${response.usage.input_tokens.toLocaleString()}\n- **Output tokens:** ${response.usage.output_tokens.toLocaleString()}\n- **Files reviewed:** ${(prMeta.changedFiles || 0)}\n- **Diff size:** ${diff.length.toLocaleString()} chars\n\n</details>`;
+
+          fs.writeFileSync('/tmp/review_output.md', reviewText + footer);
+          console.log('Claude review complete.');
+          console.log(`Tokens used â€” input: ${response.usage.input_tokens}, output: ${response.usage.output_tokens}`);
+          EOF
+
+      - name: Post review as PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          REVIEW=$(cat /tmp/review_output.md)
+          gh pr comment $PR_NUMBER --body "$REVIEW"
